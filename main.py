@@ -2,24 +2,30 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Tuple
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field, field_validator
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field, ValidationError, field_validator
+
+
+# =========================
+# Tipos
+# =========================
 
 Side = Literal["BUY", "SELL"]
 OrderStatus = Literal["FILLED"]
 
 
 # =========================
-# Arena input (ordem)
+# Entrada (ordem Arena/Nelogica)
 # =========================
 
 class ArenaOrderIn(BaseModel):
     id: str
     code: str
-    side: str          # "0" ou "1"
+    side: str          # "0" ou "1" (ou pode vir BUY/SELL no futuro)
     price: str
     active: bool
     status: str        # "1" = executada
@@ -42,12 +48,9 @@ class ArenaOrderIn(BaseModel):
         return v
 
 
-# =========================
-# Wrappers (n8n)
-# =========================
-
 class OrdersPayload(BaseModel):
     orders: List[ArenaOrderIn]
+
 
 class BodyPayload(BaseModel):
     body: List[ArenaOrderIn]
@@ -75,7 +78,7 @@ class OrderIn(BaseModel):
 
 
 # =========================
-# Output
+# Saída
 # =========================
 
 class CleanOrder(BaseModel):
@@ -129,7 +132,8 @@ def symbol_prefix(symbol: str) -> str:
     return symbol[:3].upper().strip()
 
 
-SIDE_MAP = {"0": "BUY", "1": "SELL"}   # se estiver invertido na sua origem, troca aqui
+# mantém seu padrão: "0"=BUY e "1"=SELL
+SIDE_MAP = {"0": "BUY", "1": "SELL", "BUY": "BUY", "SELL": "SELL"}
 VALID_STATUS = {"1"}
 
 
@@ -139,14 +143,14 @@ def arena_to_orderin(a: ArenaOrderIn) -> Optional[OrderIn]:
     if a.status not in VALID_STATUS:
         return None
 
-    side = SIDE_MAP.get(a.side)
+    side = SIDE_MAP.get(str(a.side).strip().upper())
     if not side:
         return None
 
     try:
         qty = float(a.quantity)
         price = float(a.price)
-    except ValueError:
+    except Exception:
         return None
 
     if qty <= 0 or price <= 0:
@@ -156,7 +160,7 @@ def arena_to_orderin(a: ArenaOrderIn) -> Optional[OrderIn]:
         order_id=a.id,
         timestamp=a.dateTime,
         symbol=a.code,
-        side=side,
+        side=side,  # type: ignore
         qty=qty,
         price=price,
         status="FILLED",
@@ -172,7 +176,7 @@ def close_qty_portion(pos_qty: float, delta_qty: float) -> float:
 
 
 # =========================
-# Core – gera operações
+# Core – gera operações por prefixo
 # =========================
 
 class _BuildResult(BaseModel):
@@ -245,7 +249,7 @@ def build_operations_for_prefix(orders: List[OrderIn], point_value: Optional[flo
             pref = symbol_prefix(o.symbol)
             continue
 
-        # aumento posição
+        # aumenta posição
         if (pos_qty > 0 and dqty > 0) or (pos_qty < 0 and dqty < 0):
             new_qty = pos_qty + dqty
             avg_entry = (abs(pos_qty) * avg_entry + abs(dqty) * o.price) / abs(new_qty)
@@ -302,7 +306,7 @@ def build_operations_for_prefix(orders: List[OrderIn], point_value: Optional[flo
 
 def module0_process(orders: List[OrderIn], pv_map: Dict[str, float]) -> Module0Response:
     if not orders:
-        raise HTTPException(status_code=400, detail="Nenhuma ordem válida após filtro.")
+        raise HTTPException(status_code=400, detail="Nenhuma ordem válida após filtro (active/status/side/qty/price).")
 
     orders.sort(key=lambda x: x.timestamp)
 
@@ -348,62 +352,143 @@ def module0_process(orders: List[OrderIn], pv_map: Dict[str, float]) -> Module0R
 
 
 # =========================
+# Parsing flexível (como no seu main antigo)
+# =========================
+
+def _extract_orders(payload: Any) -> Tuple[List[ArenaOrderIn], Dict[str, Any], str]:
+    """
+    Aceita:
+      - [ {ordem}, {ordem} ]
+      - { "orders": [ ... ], ...extras }
+      - { "body": [ ... ], ...extras }   (n8n)
+      - [ { "orders": [ ... ] }, ... ]
+    Retorna (orders, extras, shape)
+    """
+    extras: Dict[str, Any] = {}
+
+    # { body: [...] }
+    if isinstance(payload, dict) and "body" in payload:
+        bp = BodyPayload.model_validate(payload)
+        extras = {k: v for k, v in payload.items() if k != "body"}
+        return bp.body, extras, "BodyPayload"
+
+    # { orders: [...] }
+    if isinstance(payload, dict) and "orders" in payload:
+        op = OrdersPayload.model_validate(payload)
+        extras = {k: v for k, v in payload.items() if k != "orders"}
+        return op.orders, extras, "OrdersPayload"
+
+    # [ { orders: [...] } ]
+    if isinstance(payload, list) and payload and isinstance(payload[0], dict) and "orders" in payload[0]:
+        out: List[ArenaOrderIn] = []
+        for item in payload:
+            op = OrdersPayload.model_validate(item)
+            out.extend(op.orders)
+        return out, extras, "List[OrdersPayload]"
+
+    # [ {ordem}, {ordem} ]
+    if isinstance(payload, list):
+        out = [ArenaOrderIn.model_validate(x) for x in payload]
+        return out, extras, "List[ArenaOrderIn]"
+
+    raise HTTPException(status_code=400, detail=f"Formato inválido. type={type(payload)}")
+
+
+# =========================
 # FastAPI
 # =========================
 
-app = FastAPI(title="Trader Analysis MVP", version="0.1.0")
+app = FastAPI(title="Trader Analysis MVP", version="0.2.0")
 
 
-def _extract_arena_orders(payload: Any) -> tuple[List[ArenaOrderIn], str]:
-    """
-    Aceita:
-      1) [ {ordem}, {ordem} ]
-      2) { "orders": [ ... ] }
-      3) [ { "orders": [ ... ] } ]
-      4) { "body": [ ... ] }  <-- n8n HTTP node style
-    Retorna (orders, shape)
-    """
-    # 4) { body: [...] }
-    if isinstance(payload, dict) and "body" in payload:
-        bp = BodyPayload.model_validate(payload)
-        return bp.body, "BodyPayload"
-
-    # 2) { orders: [...] }
-    if isinstance(payload, dict) and "orders" in payload:
-        op = OrdersPayload.model_validate(payload)
-        return op.orders, "OrdersPayload"
-
-    # 1) array puro ou 3) array de wrappers
-    if isinstance(payload, list):
-        if len(payload) == 0:
-            return [], "EmptyList"
-        if isinstance(payload[0], dict) and "orders" in payload[0]:
-            out: List[ArenaOrderIn] = []
-            for item in payload:
-                op = OrdersPayload.model_validate(item)
-                out.extend(op.orders)
-            return out, "List[OrdersPayload]"
-        # array puro de ordens
-        out = [ArenaOrderIn.model_validate(x) for x in payload]
-        return out, "List[ArenaOrderIn]"
-
-    raise HTTPException(status_code=400, detail="Payload inválido.")
+@app.get("/")
+def ping():
+    return {"mensagem": "API ativa. Use POST / (ou /analyze) para analisar."}
 
 
-@app.post("/analyze", response_model=Module0Response)
-async def analyze(payload: Any):
-    arena_orders, shape = _extract_arena_orders(payload)
+@app.get("/health")
+def health():
+    return {"ok": True}
 
+
+@app.post("/echo")
+async def echo(req: Request):
+    try:
+        payload = await req.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Falha lendo JSON: {repr(e)}")
+    return {
+        "payload_type": str(type(payload)),
+        "keys": list(payload.keys()) if isinstance(payload, dict) else None,
+        "first_item_keys": list(payload[0].keys()) if isinstance(payload, list) and payload and isinstance(payload[0], dict) else None,
+        "payload": payload,
+    }
+
+
+async def _analyze_impl(req: Request):
+    # lê json
+    try:
+        payload = await req.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Falha lendo JSON: {repr(e)}")
+
+    # extrai
+    try:
+        arena_orders, extras, shape = _extract_orders(payload)
+    except ValidationError as ve:
+        raise HTTPException(status_code=422, detail={
+            "msg": "Erro validando payload",
+            "payload_type": str(type(payload)),
+            "payload_keys": list(payload.keys()) if isinstance(payload, dict) else None,
+            "errors": ve.errors(),
+        })
+
+    # converte e conta ignoradas
     internal: List[OrderIn] = []
     ignored = 0
+    ignored_reasons = {
+        "inactive": 0,
+        "status_not_1": 0,
+        "side_invalid": 0,
+        "qty_or_price_invalid": 0,
+    }
 
     for ao in arena_orders:
+        if not ao.active:
+            ignored += 1
+            ignored_reasons["inactive"] += 1
+            continue
+        if ao.status not in VALID_STATUS:
+            ignored += 1
+            ignored_reasons["status_not_1"] += 1
+            continue
+
+        s = str(ao.side).strip().upper()
+        if s not in SIDE_MAP:
+            ignored += 1
+            ignored_reasons["side_invalid"] += 1
+            continue
+
+        try:
+            qty = float(ao.quantity)
+            price = float(ao.price)
+        except Exception:
+            ignored += 1
+            ignored_reasons["qty_or_price_invalid"] += 1
+            continue
+
+        if qty <= 0 or price <= 0:
+            ignored += 1
+            ignored_reasons["qty_or_price_invalid"] += 1
+            continue
+
         oi = arena_to_orderin(ao)
         if oi:
             internal.append(oi)
         else:
             ignored += 1
 
+    # valores de ponto (se quiser fixar já)
     pv_map = {
         # "WIN": 0.2,
         # "WDO": 10.0,
@@ -411,5 +496,32 @@ async def analyze(payload: Any):
 
     resp = module0_process(internal, pv_map=pv_map)
     resp.meta["orders_ignored"] = ignored
+    resp.meta["ignored_reasons"] = ignored_reasons
     resp.meta["payload_shape"] = shape
+    resp.meta["extras_keys"] = list(extras.keys())
     return resp
+
+
+@app.post("/", response_model=Module0Response)
+async def analyze_root(req: Request):
+    # compatibilidade total com teu main antigo
+    return await _analyze_impl(req)
+
+
+@app.post("/analyze", response_model=Module0Response)
+async def analyze(req: Request):
+    return await _analyze_impl(req)
+
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    # erro bem explícito pra debug
+    return JSONResponse(
+        status_code=500,
+        content={
+            "msg": "Erro interno",
+            "path": str(request.url.path),
+            "error": repr(exc),
+            "request_id": str(uuid4()),
+        },
+    )
