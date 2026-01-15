@@ -1,11 +1,11 @@
-# module0_fastapi.py
+# main.py
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Union
 from uuid import uuid4
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field, field_validator
 
 Side = Literal["BUY", "SELL"]
@@ -13,7 +13,7 @@ OrderStatus = Literal["FILLED"]
 
 
 # =========================
-# Arena input (único formato aceito)
+# Arena input (formato base)
 # =========================
 
 class ArenaOrderIn(BaseModel):
@@ -40,6 +40,14 @@ class ArenaOrderIn(BaseModel):
         if v.tzinfo is None:
             return v.replace(tzinfo=timezone.utc)
         return v
+
+
+# =========================
+# Payload wrappers (pra aguentar n8n)
+# =========================
+
+class OrdersPayload(BaseModel):
+    orders: List[ArenaOrderIn]
 
 
 # =========================
@@ -343,11 +351,35 @@ def module0_process(orders: List[OrderIn], pv_map: Dict[str, float]) -> Module0R
 app = FastAPI(title="Trader Analysis MVP", version="0.1.0")
 
 
+def _extract_arena_orders(payload: Union[List[ArenaOrderIn], OrdersPayload, List[OrdersPayload]]) -> List[ArenaOrderIn]:
+    """
+    Aceita:
+      1) array puro: [ {ordem}, {ordem} ]
+      2) objeto: { "orders": [ ... ] }
+      3) array com 1 objeto: [ { "orders": [ ... ] } ] (n8n às vezes faz isso)
+    """
+    # 1) array puro de ordens
+    if isinstance(payload, list) and (len(payload) == 0 or isinstance(payload[0], ArenaOrderIn)):
+        return payload
+
+    # 2) { orders: [...] }
+    if isinstance(payload, OrdersPayload):
+        return payload.orders
+
+    # 3) [ { orders: [...] } ]
+    if isinstance(payload, list) and len(payload) > 0 and isinstance(payload[0], OrdersPayload):
+        out: List[ArenaOrderIn] = []
+        for p in payload:
+            out.extend(p.orders)
+        return out
+
+    raise HTTPException(status_code=400, detail="Payload inválido. Use array de ordens ou {orders:[...]}.")
+
+
 @app.post("/analyze", response_model=Module0Response)
-async def analyze(arena_orders: List[ArenaOrderIn]):
-    """
-    Aceita APENAS array no formato Arena/Nelogica.
-    """
+async def analyze(payload: Union[List[ArenaOrderIn], OrdersPayload, List[OrdersPayload]]):
+    arena_orders = _extract_arena_orders(payload)
+
     internal: List[OrderIn] = []
     ignored = 0
 
@@ -358,7 +390,6 @@ async def analyze(arena_orders: List[ArenaOrderIn]):
         else:
             ignored += 1
 
-    # se quiser, já fixa valores de ponto aqui
     pv_map = {
         # "WIN": 0.2,
         # "WDO": 10.0,
@@ -366,4 +397,9 @@ async def analyze(arena_orders: List[ArenaOrderIn]):
 
     resp = module0_process(internal, pv_map=pv_map)
     resp.meta["orders_ignored"] = ignored
+    resp.meta["payload_shape"] = (
+        "list[ArenaOrderIn]" if (isinstance(payload, list) and (len(payload) == 0 or isinstance(payload[0], ArenaOrderIn)))
+        else "OrdersPayload" if isinstance(payload, OrdersPayload)
+        else "list[OrdersPayload]"
+    )
     return resp
