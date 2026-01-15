@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
@@ -25,31 +25,45 @@ OrderStatus = Literal["FILLED"]
 class ArenaOrderIn(BaseModel):
     id: str
     code: str
-    side: str          # "0" ou "1" (ou pode vir BUY/SELL no futuro)
-    price: str
+
+    # antigo: "0"/"1" (string)
+    # novo: 0/1 (int)
+    side: Union[str, int]
+
+    # antigo: "5548.500000000"
+    # novo: "165920.00" (string) ou número
+    price: Union[str, float, int]
+
     active: bool
 
     # compatibilidade:
     # - antigo: status="1" (executada)
-    # - novo: status=0 e statusCalculate=1 (executada)
-    status: Optional[str] = None
-    statusCalculate: Optional[int] = None
+    # - novo: status=1 (int) e statusCalculate=1 (executada)
+    status: Optional[Union[str, int]] = None
+    statusCalculate: Optional[Union[int, str]] = None
 
     tradeId: Optional[str] = None
     dateTime: datetime
     personId: Optional[str] = None
-    quantity: str
+
+    # antigo: "1" (string)
+    # novo: 1 (int)
+    quantity: Union[str, float, int]
+
     createdAt: Optional[datetime] = None
     updatedAt: Optional[datetime] = None
     groupOrderId: Optional[str] = None
     tournamentId: Optional[str] = None
     tournamentPersonId: Optional[str] = None
     token: Optional[str] = None
+
+    # novo
     operationId: Optional[str] = None
 
     @field_validator("dateTime")
     @classmethod
     def ensure_tz(cls, v: datetime) -> datetime:
+        # Pydantic já converte "Z" -> tzinfo geralmente, mas garantimos.
         if v.tzinfo is None:
             return v.replace(tzinfo=timezone.utc)
         return v
@@ -139,13 +153,16 @@ def symbol_prefix(symbol: str) -> str:
     return symbol[:3].upper().strip()
 
 
-# mantém seu padrão: "0"=BUY e "1"=SELL
+# mantém seu padrão: "0"=BUY e "1"=SELL (mas aceitamos BUY/SELL também)
 SIDE_MAP = {"0": "BUY", "1": "SELL", "BUY": "BUY", "SELL": "SELL"}
 
-# regras de executada:
-# - se status == "1" => executada (antigo)
-# - se statusCalculate == 1 => executada (novo)
+
 def is_executed(a: ArenaOrderIn) -> bool:
+    """
+    Executada se:
+      - status == "1" ou 1
+      - OU statusCalculate == 1 (novo)
+    """
     if a.status is not None and str(a.status).strip() == "1":
         return True
     if a.statusCalculate is not None and int(a.statusCalculate) == 1:
@@ -324,7 +341,7 @@ def build_operations_for_prefix(orders: List[OrderIn], point_value: Optional[flo
 
 def module0_process(orders: List[OrderIn], pv_map: Dict[str, float]) -> Module0Response:
     if not orders:
-        raise HTTPException(status_code=400, detail="Nenhuma ordem válida após filtro (active/status/side/qty/price).")
+        raise HTTPException(status_code=400, detail="Nenhuma ordem válida após filtro (active/executed/side/qty/price).")
 
     orders.sort(key=lambda x: x.timestamp)
 
@@ -379,8 +396,7 @@ def _extract_orders(payload: Any) -> Tuple[List[ArenaOrderIn], Dict[str, Any], s
       - [ {ordem}, {ordem} ]
       - { "orders": [ ... ], ...extras }
       - { "body": [ ... ], ...extras }   (n8n)
-      - [ { "orders": [ ... ] }, ... ]   (novo)
-      - [ { "orders": [ ... ] } ]        (novo)
+      - [ { "orders": [ ... ] }, ... ]
     Retorna (orders, extras, shape)
     """
     extras: Dict[str, Any] = {}
@@ -397,7 +413,7 @@ def _extract_orders(payload: Any) -> Tuple[List[ArenaOrderIn], Dict[str, Any], s
         extras = {k: v for k, v in payload.items() if k != "orders"}
         return op.orders, extras, "OrdersPayload"
 
-    # [ { orders: [...] }, { orders: [...] } ]  (novo)
+    # [ { orders: [...] }, ... ]
     if isinstance(payload, list) and payload and isinstance(payload[0], dict) and "orders" in payload[0]:
         out: List[ArenaOrderIn] = []
         for item in payload:
@@ -417,7 +433,7 @@ def _extract_orders(payload: Any) -> Tuple[List[ArenaOrderIn], Dict[str, Any], s
 # FastAPI
 # =========================
 
-app = FastAPI(title="Trader Analysis MVP", version="0.2.1")
+app = FastAPI(title="Trader Analysis MVP", version="0.2.2")
 
 
 @app.get("/")
