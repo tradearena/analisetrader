@@ -1,208 +1,369 @@
-from fastapi import FastAPI, Request
-import pandas as pd
-import traceback
-import numpy as np
+# module0_fastapi.py
+from __future__ import annotations
 
-app = FastAPI()
+from datetime import datetime, timezone
+from typing import Any, Dict, List, Literal, Optional
+from uuid import uuid4
 
-# Fatores por PREFIXO
-multiplicadores = {'WIN': 0.2, 'WDO': 10.0, 'BIT': 0.1}
-emolumentos     = {'WIN': 0.25, 'WDO': 1.20, 'BIT': 3.00}
+from fastapi import FastAPI, HTTPException, Request
+from pydantic import BaseModel, Field, field_validator
 
-def convert_numpy(obj):
-    if isinstance(obj, (np.integer,)):
-        return int(obj)
-    elif isinstance(obj, (np.floating,)):
-        return float(obj)
-    elif isinstance(obj, (np.ndarray,)):
-        return obj.tolist()
-    return obj
+Side = Literal["BUY", "SELL"]
+OrderStatus = Literal["FILLED"]
 
-def map_side(val):
-    if val is None:
-        return np.nan
-    s = str(val).strip().upper()
-    if s in {"0", "BUY", "COMPRA", "B"}:
-        return "COMPRA"
-    if s in {"1", "SELL", "VENDA", "S"}:
-        return "VENDA"
-    return np.nan
 
-@app.get("/")
-def ping():
-    return {"mensagem": "API ativa. Use POST / ou /calcular-resultado"}
+# =========================
+# Arena input (único formato aceito)
+# =========================
 
-@app.post("/")
-async def calcular_raiz(request: Request):
-    return await calcular_resultado(request)
+class ArenaOrderIn(BaseModel):
+    id: str
+    code: str
+    side: str          # "0" ou "1"
+    price: str
+    active: bool
+    status: str        # "1" = executada
+    tradeId: Optional[str] = None
+    dateTime: datetime
+    personId: Optional[str] = None
+    quantity: str
+    createdAt: Optional[datetime] = None
+    updatedAt: Optional[datetime] = None
+    groupOrderId: Optional[str] = None
+    tournamentId: Optional[str] = None
+    tournamentPersonId: Optional[str] = None
+    token: Optional[str] = None
 
-@app.post("/calcular-resultado")
-async def calcular_resultado(request: Request):
+    @field_validator("dateTime")
+    @classmethod
+    def ensure_tz(cls, v: datetime) -> datetime:
+        if v.tzinfo is None:
+            return v.replace(tzinfo=timezone.utc)
+        return v
+
+
+# =========================
+# Canonical interno
+# =========================
+
+class OrderIn(BaseModel):
+    order_id: str
+    timestamp: datetime
+    symbol: str
+    side: Side
+    qty: float = Field(..., gt=0)
+    price: float = Field(..., gt=0)
+    status: OrderStatus = "FILLED"
+
+    @field_validator("timestamp")
+    @classmethod
+    def ensure_tz(cls, v: datetime) -> datetime:
+        if v.tzinfo is None:
+            return v.replace(tzinfo=timezone.utc)
+        return v
+
+
+# =========================
+# Output
+# =========================
+
+class CleanOrder(BaseModel):
+    order_id: str
+    timestamp: datetime
+    symbol: str
+    symbol_prefix: str
+    side: Side
+    qty: float
+    price: float
+    status: OrderStatus
+
+
+class OperationOut(BaseModel):
+    symbol_prefix: str
+    symbol: str
+    direction: Literal["LONG", "SHORT"]
+    qty: float
+    open_time: datetime
+    close_time: datetime
+    duration_sec: float
+    avg_entry_price: float
+    avg_exit_price: float
+    pnl_points: float
+    pnl_money: Optional[float] = None
+    trades_count: int
+
+
+class OpenPositionOut(BaseModel):
+    symbol_prefix: str
+    symbol: str
+    direction: Literal["LONG", "SHORT"]
+    qty: float
+    avg_entry_price: float
+    open_time: datetime
+
+
+class Module0Response(BaseModel):
+    request_id: str
+    meta: Dict[str, Any]
+    orders_clean: List[CleanOrder]
+    operations: List[OperationOut]
+    open_positions: List[OpenPositionOut]
+
+
+# =========================
+# Helpers
+# =========================
+
+def symbol_prefix(symbol: str) -> str:
+    return symbol[:3].upper().strip()
+
+
+SIDE_MAP = {"0": "BUY", "1": "SELL"}
+VALID_STATUS = {"1"}
+
+
+def arena_to_orderin(a: ArenaOrderIn) -> Optional[OrderIn]:
+    if not a.active:
+        return None
+    if a.status not in VALID_STATUS:
+        return None
+
+    side = SIDE_MAP.get(a.side)
+    if not side:
+        return None
+
     try:
-        json_data = await request.json()
+        qty = float(a.quantity)
+        price = float(a.price)
+    except ValueError:
+        return None
 
-        if isinstance(json_data, list):
-            orders = json_data
-            extra = {}
-        elif isinstance(json_data, dict) and "orders" in json_data:
-            orders = json_data["orders"]
-            extra  = {k: v for k, v in json_data.items() if k != "orders"}
+    if qty <= 0 or price <= 0:
+        return None
+
+    return OrderIn(
+        order_id=a.id,
+        timestamp=a.dateTime,
+        symbol=a.code,
+        side=side,
+        qty=qty,
+        price=price,
+        status="FILLED",
+    )
+
+
+def signed_qty(side: Side, qty: float) -> float:
+    return qty if side == "BUY" else -qty
+
+
+def close_qty_portion(pos_qty: float, delta_qty: float) -> float:
+    return min(abs(pos_qty), abs(delta_qty))
+
+
+# =========================
+# Core – gera operações
+# =========================
+
+class _BuildResult(BaseModel):
+    operations: List[OperationOut]
+    open_position: Optional[OpenPositionOut] = None
+
+
+def build_operations_for_prefix(orders: List[OrderIn], point_value: Optional[float]) -> _BuildResult:
+    ops: List[OperationOut] = []
+
+    pos_qty = 0.0
+    avg_entry = 0.0
+    op_open_time: Optional[datetime] = None
+    op_direction: Optional[str] = None
+    open_symbol: Optional[str] = None
+    pref: Optional[str] = None
+
+    exit_notional = 0.0
+    exit_qty_accum = 0.0
+    trades_count = 0
+    op_pnl_points = 0.0
+
+    def finalize_op(close_time: datetime):
+        nonlocal op_open_time, op_direction, open_symbol, pref
+        nonlocal exit_notional, exit_qty_accum, trades_count, op_pnl_points
+
+        if not all([op_open_time, op_direction, open_symbol, pref]):
+            return
+        if exit_qty_accum <= 0:
+            return
+
+        avg_exit = exit_notional / exit_qty_accum
+        duration = (close_time - op_open_time).total_seconds()
+        pnl_money = (op_pnl_points * point_value) if point_value is not None else None
+
+        ops.append(OperationOut(
+            symbol_prefix=pref,
+            symbol=open_symbol,
+            direction="LONG" if op_direction == "LONG" else "SHORT",
+            qty=exit_qty_accum,
+            open_time=op_open_time,
+            close_time=close_time,
+            duration_sec=duration,
+            avg_entry_price=avg_entry,
+            avg_exit_price=avg_exit,
+            pnl_points=op_pnl_points,
+            pnl_money=pnl_money,
+            trades_count=trades_count,
+        ))
+
+        op_open_time = None
+        op_direction = None
+        open_symbol = None
+        pref = None
+        exit_notional = 0.0
+        exit_qty_accum = 0.0
+        trades_count = 0
+        op_pnl_points = 0.0
+
+    for o in orders:
+        dqty = signed_qty(o.side, float(o.qty))
+        trades_count += 1
+
+        if pos_qty == 0:
+            pos_qty = dqty
+            avg_entry = o.price
+            op_open_time = o.timestamp
+            op_direction = "LONG" if pos_qty > 0 else "SHORT"
+            open_symbol = o.symbol
+            pref = symbol_prefix(o.symbol)
+            continue
+
+        # aumento posição
+        if (pos_qty > 0 and dqty > 0) or (pos_qty < 0 and dqty < 0):
+            new_qty = pos_qty + dqty
+            avg_entry = (abs(pos_qty) * avg_entry + abs(dqty) * o.price) / abs(new_qty)
+            pos_qty = new_qty
+            continue
+
+        # fechamento parcial/total
+        close_abs = close_qty_portion(pos_qty, dqty)
+
+        if pos_qty > 0:
+            realized = close_abs * (o.price - avg_entry)
         else:
-            return {"erro": "Formato de JSON inválido. Envie um array ou um objeto com 'orders'."}
+            realized = close_abs * (avg_entry - o.price)
 
-        if not orders:
-            return {"erro": "Lista de ordens vazia."}
+        op_pnl_points += realized
+        exit_notional += close_abs * o.price
+        exit_qty_accum += close_abs
 
-    except Exception as e:
-        return {"erro": f"Erro ao processar JSON: {str(e)}"}
+        if abs(dqty) < abs(pos_qty):
+            pos_qty = pos_qty + dqty
+            continue
 
-    try:
-        df = pd.DataFrame(orders)
+        if abs(dqty) == abs(pos_qty):
+            pos_qty = 0.0
+            finalize_op(close_time=o.timestamp)
+            avg_entry = 0.0
+            continue
 
-        # Normalizações
-        df["dateTime"] = pd.to_datetime(df.get("dateTime"), errors="coerce")
-        df["side"]     = df.get("side").apply(map_side)
-        df["code"]     = df.get("code").astype(str).str.upper()
-        df["token"]    = df.get("token").astype(str)
-        df["quantity"] = pd.to_numeric(df.get("quantity"), errors="coerce")
-        df["price"]    = pd.to_numeric(df.get("price"), errors="coerce")
-        df["prefix"]   = df["code"].str[:3]
+        # inversão
+        remaining = pos_qty + dqty
+        pos_qty = 0.0
+        finalize_op(close_time=o.timestamp)
 
-        df = df.dropna(subset=["quantity", "price", "dateTime", "side", "prefix"])
+        pos_qty = remaining
+        avg_entry = o.price
+        op_open_time = o.timestamp
+        op_direction = "LONG" if pos_qty > 0 else "SHORT"
+        open_symbol = o.symbol
+        pref = symbol_prefix(o.symbol)
 
-        # ---------- Último preço por PREFIXO ----------
-        # 1) Se vier no body (opcional), usa lastPricesPrefix (ex.: {"WDO": 5488, "WIN": 142215})
-        last_body = {}
-        if isinstance(extra, dict) and "lastPricesPrefix" in extra and isinstance(extra["lastPricesPrefix"], dict):
-            last_body = {str(k).upper(): float(v) for k, v in extra["lastPricesPrefix"].items() if v is not None}
-
-        # 2) Último preço do TOKEN "1" por prefixo (no payload)
-        df_sorted = df.sort_values("dateTime")
-        df_t1 = df_sorted[df_sorted["token"] == "1"].copy()
-        ultimo_prefix_token1 = (
-            df_t1.groupby("prefix")["price"].last().to_dict()
-            if not df_t1.empty else {}
+    open_pos: Optional[OpenPositionOut] = None
+    if pos_qty != 0 and op_open_time and open_symbol:
+        open_pos = OpenPositionOut(
+            symbol_prefix=symbol_prefix(open_symbol),
+            symbol=open_symbol,
+            direction="LONG" if pos_qty > 0 else "SHORT",
+            qty=abs(pos_qty),
+            avg_entry_price=avg_entry,
+            open_time=op_open_time,
         )
 
-        # 3) Fallback: último preço por prefixo (todos tokens) no payload
-        ultimo_prefix_all = df_sorted.groupby("prefix")["price"].last().to_dict()
+    return _BuildResult(operations=ops, open_position=open_pos)
 
-        def get_last_price_prefix(prefix: str) -> float:
-            p = (prefix or "").upper()
-            if p in last_body:
-                return last_body[p]
-            if p in ultimo_prefix_token1:
-                return ultimo_prefix_token1[p]
-            return ultimo_prefix_all.get(p, 0.0)
 
-        resultados = []
+def module0_process(orders: List[OrderIn], pv_map: Dict[str, float]) -> Module0Response:
+    if not orders:
+        raise HTTPException(status_code=400, detail="Nenhuma ordem válida após filtro.")
 
-        # ---------- Loop por usuário (token) ----------
-        for usuario, g_token in df.groupby("token"):
-            lucro_realizado_total = 0.0
-            pnl_aberto_total = 0.0
-            custo_total = 0.0
+    orders.sort(key=lambda x: x.timestamp)
 
-            qtde_contratos_total = 0.0
-            qtde_compra_total = 0.0
-            qtde_venda_total = 0.0
-            ordens = len(g_token)
+    by_prefix: Dict[str, List[OrderIn]] = {}
+    clean: List[CleanOrder] = []
 
-            # ---------- Processa por PREFIXO (mistura maturidades por design) ----------
-            for prefix, g_pref in g_token.groupby("prefix"):
-                mult = multiplicadores.get(prefix, 0.0)
-                taxa_emol = emolumentos.get(prefix, 0.0)
+    for o in orders:
+        pref = symbol_prefix(o.symbol)
+        by_prefix.setdefault(pref, []).append(o)
+        clean.append(CleanOrder(
+            order_id=o.order_id,
+            timestamp=o.timestamp,
+            symbol=o.symbol,
+            symbol_prefix=pref,
+            side=o.side,
+            qty=o.qty,
+            price=o.price,
+            status=o.status,
+        ))
 
-                g_pref = g_pref.sort_values("dateTime")
+    ops: List[OperationOut] = []
+    open_positions: List[OpenPositionOut] = []
 
-                # Métricas de volume
-                vol_total = g_pref["quantity"].sum()
-                qtde_contratos_total += vol_total
-                qtde_compra_total += g_pref.loc[g_pref["side"] == "COMPRA", "quantity"].sum()
-                qtde_venda_total += g_pref.loc[g_pref["side"] == "VENDA", "quantity"].sum()
+    for pref, olist in by_prefix.items():
+        result = build_operations_for_prefix(olist, point_value=pv_map.get(pref))
+        ops.extend(result.operations)
+        if result.open_position:
+            open_positions.append(result.open_position)
 
-                # Emolumentos por volume do prefixo
-                custo_total += vol_total * taxa_emol
+    return Module0Response(
+        request_id=str(uuid4()),
+        meta={
+            "orders_used": len(orders),
+            "operations_built": len(ops),
+            "open_positions": len(open_positions),
+            "prefixes": sorted(by_prefix.keys()),
+            "side_map": SIDE_MAP,
+        },
+        orders_clean=clean,
+        operations=ops,
+        open_positions=open_positions,
+    )
 
-                # ---- Motor WAC (custo médio móvel) POR PREFIXO ----
-                pos = 0.0            # >0 long, <0 short, 0 zerado
-                pm = 0.0             # preço médio da posição aberta
-                pnl_realizado = 0.0  # acumulado no prefixo
 
-                for _, row in g_pref.iterrows():
-                    qty = float(row["quantity"])
-                    px = float(row["price"])
-                    side = row["side"]
+# =========================
+# FastAPI
+# =========================
 
-                    if side == "COMPRA":
-                        # Fecha short se existir
-                        if pos < 0:
-                            match_qty = min(qty, -pos)
-                            pnl_realizado += (pm - px) * match_qty * mult  # short fecha comprando
-                            pos += match_qty
-                            qty -= match_qty
-                            if pos == 0:
-                                pm = 0.0
-                        # Abre/aumenta long com eventual sobra
-                        if qty > 0:
-                            if pos == 0:
-                                pm = px
-                                pos = qty
-                            else:
-                                # pos >= 0 aqui
-                                pm = (pm * pos + px * qty) / (pos + qty)
-                                pos += qty
+app = FastAPI(title="Trader Analysis MVP", version="0.1.0")
 
-                    elif side == "VENDA":
-                        # Fecha long se existir
-                        if pos > 0:
-                            match_qty = min(qty, pos)
-                            pnl_realizado += (px - pm) * match_qty * mult  # long fecha vendendo
-                            pos -= match_qty
-                            qty -= match_qty
-                            if pos == 0:
-                                pm = 0.0
-                        # Abre/aumenta short com eventual sobra
-                        if qty > 0:
-                            if pos == 0:
-                                pm = px
-                                pos = -qty
-                            else:
-                                # pos <= 0 aqui
-                                abspos = abs(pos)
-                                pm = (pm * abspos + px * qty) / (abspos + qty)
-                                pos -= qty
-                    else:
-                        continue
 
-                # ---- PnL aberto (fechamento fantasma) por PREFIXO usando preço do token '1' ----
-                ultimo_preco = get_last_price_prefix(prefix)
-                pnl_aberto = 0.0
-                if pos > 0:
-                    pnl_aberto = (ultimo_preco - pm) * pos * mult
-                elif pos < 0:
-                    pnl_aberto = (pm - ultimo_preco) * (-pos) * mult
+@app.post("/analyze", response_model=Module0Response)
+async def analyze(arena_orders: List[ArenaOrderIn]):
+    """
+    Aceita APENAS array no formato Arena/Nelogica.
+    """
+    internal: List[OrderIn] = []
+    ignored = 0
 
-                lucro_realizado_total += pnl_realizado
-                pnl_aberto_total += pnl_aberto
+    for ao in arena_orders:
+        oi = arena_to_orderin(ao)
+        if oi:
+            internal.append(oi)
+        else:
+            ignored += 1
 
-            lucro_bruto = lucro_realizado_total + pnl_aberto_total
-            lucro_liquido = lucro_bruto - custo_total
+    # se quiser, já fixa valores de ponto aqui
+    pv_map = {
+        # "WIN": 0.2,
+        # "WDO": 10.0,
+    }
 
-            resultados.append({
-                "token": usuario,
-                "lucroBruto": round(lucro_bruto, 2),
-                "lucroLiquido": round(lucro_liquido, 2),
-                "qtdeOrdens": ordens,
-                "qtdeContratos": round(qtde_contratos_total, 2),
-                "qtdeCompra": round(qtde_compra_total, 2),
-                "qtdeVenda": round(qtde_venda_total, 2)
-            })
-
-        # Conversão p/ tipos nativos
-        resultados = [{k: convert_numpy(v) for k, v in item.items()} for item in resultados]
-        return resultados
-
-    except Exception as e:
-        print(traceback.format_exc())
-        return {"erro": f"Erro interno durante o cálculo: {str(e)}"}
+    resp = module0_process(internal, pv_map=pv_map)
+    resp.meta["orders_ignored"] = ignored
+    return resp
