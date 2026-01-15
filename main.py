@@ -13,7 +13,7 @@ OrderStatus = Literal["FILLED"]
 
 
 # =========================
-# Arena input (formato base)
+# Arena input (ordem)
 # =========================
 
 class ArenaOrderIn(BaseModel):
@@ -43,11 +43,14 @@ class ArenaOrderIn(BaseModel):
 
 
 # =========================
-# Payload wrappers (pra aguentar n8n)
+# Wrappers (n8n)
 # =========================
 
 class OrdersPayload(BaseModel):
     orders: List[ArenaOrderIn]
+
+class BodyPayload(BaseModel):
+    body: List[ArenaOrderIn]
 
 
 # =========================
@@ -126,7 +129,7 @@ def symbol_prefix(symbol: str) -> str:
     return symbol[:3].upper().strip()
 
 
-SIDE_MAP = {"0": "BUY", "1": "SELL"}
+SIDE_MAP = {"0": "BUY", "1": "SELL"}   # se estiver invertido na sua origem, troca aqui
 VALID_STATUS = {"1"}
 
 
@@ -351,34 +354,45 @@ def module0_process(orders: List[OrderIn], pv_map: Dict[str, float]) -> Module0R
 app = FastAPI(title="Trader Analysis MVP", version="0.1.0")
 
 
-def _extract_arena_orders(payload: Union[List[ArenaOrderIn], OrdersPayload, List[OrdersPayload]]) -> List[ArenaOrderIn]:
+def _extract_arena_orders(payload: Any) -> tuple[List[ArenaOrderIn], str]:
     """
     Aceita:
-      1) array puro: [ {ordem}, {ordem} ]
-      2) objeto: { "orders": [ ... ] }
-      3) array com 1 objeto: [ { "orders": [ ... ] } ] (n8n às vezes faz isso)
+      1) [ {ordem}, {ordem} ]
+      2) { "orders": [ ... ] }
+      3) [ { "orders": [ ... ] } ]
+      4) { "body": [ ... ] }  <-- n8n HTTP node style
+    Retorna (orders, shape)
     """
-    # 1) array puro de ordens
-    if isinstance(payload, list) and (len(payload) == 0 or isinstance(payload[0], ArenaOrderIn)):
-        return payload
+    # 4) { body: [...] }
+    if isinstance(payload, dict) and "body" in payload:
+        bp = BodyPayload.model_validate(payload)
+        return bp.body, "BodyPayload"
 
     # 2) { orders: [...] }
-    if isinstance(payload, OrdersPayload):
-        return payload.orders
+    if isinstance(payload, dict) and "orders" in payload:
+        op = OrdersPayload.model_validate(payload)
+        return op.orders, "OrdersPayload"
 
-    # 3) [ { orders: [...] } ]
-    if isinstance(payload, list) and len(payload) > 0 and isinstance(payload[0], OrdersPayload):
-        out: List[ArenaOrderIn] = []
-        for p in payload:
-            out.extend(p.orders)
-        return out
+    # 1) array puro ou 3) array de wrappers
+    if isinstance(payload, list):
+        if len(payload) == 0:
+            return [], "EmptyList"
+        if isinstance(payload[0], dict) and "orders" in payload[0]:
+            out: List[ArenaOrderIn] = []
+            for item in payload:
+                op = OrdersPayload.model_validate(item)
+                out.extend(op.orders)
+            return out, "List[OrdersPayload]"
+        # array puro de ordens
+        out = [ArenaOrderIn.model_validate(x) for x in payload]
+        return out, "List[ArenaOrderIn]"
 
-    raise HTTPException(status_code=400, detail="Payload inválido. Use array de ordens ou {orders:[...]}.")
+    raise HTTPException(status_code=400, detail="Payload inválido.")
 
 
 @app.post("/analyze", response_model=Module0Response)
-async def analyze(payload: Union[List[ArenaOrderIn], OrdersPayload, List[OrdersPayload]]):
-    arena_orders = _extract_arena_orders(payload)
+async def analyze(payload: Any):
+    arena_orders, shape = _extract_arena_orders(payload)
 
     internal: List[OrderIn] = []
     ignored = 0
@@ -397,9 +411,5 @@ async def analyze(payload: Union[List[ArenaOrderIn], OrdersPayload, List[OrdersP
 
     resp = module0_process(internal, pv_map=pv_map)
     resp.meta["orders_ignored"] = ignored
-    resp.meta["payload_shape"] = (
-        "list[ArenaOrderIn]" if (isinstance(payload, list) and (len(payload) == 0 or isinstance(payload[0], ArenaOrderIn)))
-        else "OrdersPayload" if isinstance(payload, OrdersPayload)
-        else "list[OrdersPayload]"
-    )
+    resp.meta["payload_shape"] = shape
     return resp
